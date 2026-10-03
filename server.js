@@ -33,19 +33,19 @@ function emit(job, event, data = {}) {
 function closeJob(job) { for (const res of job.clients) res.end(); job.clients.clear(); }
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 
-function extractUrls(text) { return [...new Set((text.match(/https?:\\/\\/[^\\s<>"']+/gi) || []).map(u => u.replace(/[),.!?]+$/, "")))]; }
+function extractUrls(text) { return [...new Set((text.match(/https?:\/\/[^\s<>"']+/gi) || []).map(u => u.replace(/[),.!?]+$/, "")))]; }
 function extractQuoted(text) { return [...text.matchAll(/["'“”‘’]([^"'“”‘’]{1,500})["'“”‘’]/g)].map(m => m[1].trim()).filter(Boolean); }
 function extractLikelyValues(task) {
   const values = new Set(extractQuoted(task));
   for (const p of [
-    /\\b(?:type|enter|input|fill|write|paste)\\s+(?:the\\s+)?(?:text\\s+)?["“']?([^"”']{1,250}?)(?:["”']|$|\\s+into\\s+)/i,
-    /\\b(?:search|look)\\s+(?:for|up)\\s+["“']?([^"”']{1,250}?)(?:["”']|$)/i,
-    /\\b(?:find)\\s+["“']?([^"”']{1,250}?)(?:["”']|$)/i,
-    /\\b(?:message|say|reply)\\s*[:=]?\\s*["“']([^"”']{1,500})["”']/i
+    /\b(?:type|enter|input|fill|write|paste)\s+(?:the\s+)?(?:text\s+)?["“']?([^"”']{1,250}?)(?:["”']|$|\s+into\s+)/i,
+    /\b(?:search|look)\s+(?:for|up)\s+["“']?([^"”']{1,250}?)(?:["”']|$)/i,
+    /\b(?:find)\s+["“']?([^"”']{1,250}?)(?:["”']|$)/i,
+    /\b(?:message|say|reply)\s*[:=]?\s*["“']([^"”']{1,500})["”']/i
   ]) { const m = task.match(p); if (m?.[1]) values.add(m[1].trim()); }
   return [...values].filter(v => v && v.length <= 500).slice(0, 12);
 }
-const normalize = s => String(s || "").replace(/\\s+/g, " ").trim();
+const normalize = s => String(s || "").replace(/\s+/g, " ").trim();
 
 async function inspectPage(page) {
   const title = await page.title().catch(() => ""), url = page.url();
