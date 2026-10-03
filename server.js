@@ -20,7 +20,7 @@ const jobs = new Map();
 
 function createJob(task) {
   const id = crypto.randomUUID();
-  const job = { id, task, clients: new Set(), events: [], stats: { steps: 0, requests: 0, inputTokens: 0, outputTokens: 0, totalTokens: 0, jevMs: 0, browserMs: 0, startedAt: Date.now(), finishedAt: null, status: "running" }, result: null };
+  const job = { id, task, stopRequested: false, clients: new Set(), events: [], stats: { steps: 0, requests: 0, inputTokens: 0, outputTokens: 0, totalTokens: 0, jevMs: 0, browserMs: 0, startedAt: Date.now(), finishedAt: null, status: "running" }, result: null };
   jobs.set(id, job); return job;
 }
 function emit(job, event, data = {}) {
@@ -108,6 +108,85 @@ async function executeAction(job,context,page,action) {
   }
   return {page:active,result,latencyMs:Math.round(performance.now()-started)};
 }
+
+async function geminiVisualRecovery(job, page, task, failedAction, error) {
+  if (!process.env.GEMINI_API_KEY) throw new Error("Gemini recovery is unavailable: GEMINI_API_KEY is not configured.");
+  if (job.stopRequested) throw new Error("Job stopped by user.");
+  const image = await page.screenshot({type:"jpeg",quality:55});
+  const visible = await page.locator("body").innerText({timeout:5000}).catch(()=>"");
+  const prompt = `You are JEV's visual browser recovery layer.
+The deterministic browser action failed because the DOM may have changed.
+Return ONLY valid JSON matching one of these forms:
+{"type":"click","target":"visible text"}
+{"type":"press","key":"Enter"}
+{"type":"fill","target":"visible field label","value":"text"}
+{"type":"scroll","direction":"down"}
+{"type":"wait","ms":1000}
+{"type":"stop","reason":"why no safe recovery is possible"}
+
+User task: ${task}
+Failed action: ${JSON.stringify(failedAction)}
+Failure: ${error.message}
+Visible page text (truncate aggressively): ${normalize(visible).slice(0,5000)}
+Use the screenshot to identify the intended target. Do not invent hidden elements. Prefer a visible text/label target. Never suggest JavaScript execution.`;
+  emit(job,"gemini_recovery_started",{message:"JEV failed; taking a screenshot for one visual recovery attempt."});
+  const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${process.env.GEMINI_MODEL || "gemini-2.5-flash-lite"}:generateContent`,{
+    method:"POST",
+    headers:{"Content-Type":"application/json","x-goog-api-key":process.env.GEMINI_API_KEY},
+    body:JSON.stringify({contents:[{parts:[
+      {inlineData:{mimeType:"image/jpeg",data:image.toString("base64")}},
+      {text:prompt}
+    ]}],generationConfig:{temperature:0,responseMimeType:"application/json",maxOutputTokens:180}})
+  });
+  if(!response.ok) throw new Error(`Gemini recovery API error: ${response.status} ${await response.text()}`);
+  const data=await response.json();
+  const raw=data?.candidates?.[0]?.content?.parts?.map(p=>p.text||"").join("")?.trim();
+  if(!raw) throw new Error("Gemini returned no recovery action.");
+  let action;
+  try { action=JSON.parse(raw); } catch { throw new Error("Gemini returned invalid recovery JSON."); }
+  emit(job,"gemini_recovery",{model:process.env.GEMINI_MODEL||"gemini-2.5-flash-lite",action});
+  return action;
+}
+
+async function executeVisualRecovery(job, page, recovery) {
+  if(job.stopRequested) throw new Error("Job stopped by user.");
+  switch(recovery.type){
+    case "click": {
+      const target=String(recovery.target||"").trim();
+      if(!target) throw new Error("Gemini did not provide a click target.");
+      const candidates=[
+        page.getByRole("button",{name:target,exact:false}).first(),
+        page.getByRole("link",{name:target,exact:false}).first(),
+        page.getByText(target,{exact:false}).first()
+      ];
+      for(const locator of candidates){
+        if(await locator.isVisible().catch(()=>false)){
+          await locator.click({timeout:ACTION_TIMEOUT});
+          return;
+        }
+      }
+      throw new Error(`Gemini target "${target}" was not found visibly.`);
+    }
+    case "fill": {
+      const target=String(recovery.target||"").trim(), value=String(recovery.value??"");
+      const locators=[
+        page.getByLabel(target,{exact:false}).first(),
+        page.getByPlaceholder(target,{exact:false}).first(),
+        page.locator("input:visible,textarea:visible,[contenteditable='true']:visible").first()
+      ];
+      for(const locator of locators){
+        if(await locator.isVisible().catch(()=>false)){ await locator.fill(value); return; }
+      }
+      throw new Error(`Gemini field "${target}" was not found visibly.`);
+    }
+    case "press": await page.keyboard.press(recovery.key); return;
+    case "scroll": await page.mouse.wheel(0,recovery.direction==="up"?-850:850); return;
+    case "wait": await sleep(Math.min(Number(recovery.ms)||1000,3000)); return;
+    case "stop": throw new Error(recovery.reason||"Gemini could not safely recover the task.");
+    default: throw new Error(`Unsupported Gemini recovery action: ${recovery.type}`);
+  }
+}
+
 function getStats(job){const finished=job.stats.finishedAt||Date.now();return {...job.stats,wallMs:Math.max(1,finished-job.stats.startedAt),tokensPerSecond:job.stats.totalTokens>0?Number((job.stats.totalTokens/Math.max(.001,job.stats.jevMs/1000)).toFixed(2)):0,averageJevLatencyMs:job.stats.requests?Math.round(job.stats.jevMs/job.stats.requests):0};}
 async function runJob(job,task) {
   let browser;
@@ -120,6 +199,7 @@ async function runJob(job,task) {
     emit(job,"status",{status:"navigating",message:`Opening ${initialUrl}`});
     await page.goto(initialUrl,{waitUntil:"domcontentloaded",timeout:30000});
     for(let step=1;step<=MAX_STEPS;step++){
+      if(job.stopRequested) throw new Error("Job stopped by user.");
       job.stats.steps=step; emit(job,"step_started",{step,message:`Inspecting browser state (step ${step})`});
       const pageState=await inspectPage(page); emit(job,"page_state",{step,url:pageState.url,title:pageState.title,candidateCount:pageState.candidates.length,pages:context.pages().filter(p=>!p.isClosed()).length});
       const plan=await askJev(job,task,pageState), action=getAction(plan.decision,plan.candidates);
@@ -130,14 +210,22 @@ async function runJob(job,task) {
         page=executed.page;
         emit(job,"action_complete",{step,action:action.id,latencyMs:executed.latencyMs});
       } catch(error) {
-        const message=`Browser action failed at step ${step} (${action.id}): ${error.message}`;
-        job.stats.status="failed";
-        job.stats.finishedAt=Date.now();
-        emit(job,"error",{source:"playwright",step,action:action.id,fatal:true,message});
-        emit(job,"complete",{message:"Task stopped after a browser action failure. No retry or further planning was performed.",step,url:page.url(),stats:getStats(job)});
-        return;
+        emit(job,"error",{source:"playwright",step,action:action.id,fatal:false,message:error.message});
+        try {
+          const recovery=await geminiVisualRecovery(job,page,task,action,error);
+          await executeVisualRecovery(job,page,recovery);
+          emit(job,"gemini_recovery_complete",{step,message:"Gemini recovery succeeded. Continuing without another planner loop."});
+        } catch(recoveryError) {
+          const message=`Recovery failed after browser action failure: ${recoveryError.message}`;
+          job.stats.status="failed";
+          job.stats.finishedAt=Date.now();
+          emit(job,"error",{source:"gemini-recovery",step,action:action.id,fatal:true,message});
+          emit(job,"complete",{message:"Task stopped after the failed action and one visual recovery attempt.",step,url:page.url(),stats:getStats(job)});
+          return;
+        }
       }
-      await sleep(400);
+      if(job.stopRequested) throw new Error("Job stopped by user.");
+      await sleep(Number(process.env.STEP_DELAY_MS || 5000));
     }
     throw new Error(`Maximum step count (${MAX_STEPS}) reached before the task completed.`);
   } catch(error) {
@@ -150,8 +238,9 @@ async function runJob(job,task) {
   }
   finally { if(browser) await browser.close().catch(()=>{}); job.stats.finishedAt??=Date.now(); closeJob(job); }
 }
-app.get("/api/health",(_req,res)=>res.json({ok:true,service:"JEV Browser Agent",version:"3.1.0",failurePolicy:"fail-fast-no-retry",maxSteps:MAX_STEPS,headless:process.env.HEADLESS==="true"}));
-app.post("/api/run",(req,res)=>{const task=req.body?.task;if(typeof task!=="string"||!task.trim())return res.status(400).json({error:"task is required"});const job=createJob(task.trim());runJob(job,job.task).catch(error=>emit(job,"error",{source:"unhandled",message:error.message}));res.json({jobId:job.id});});
+app.get("/api/health",(_req,res)=>res.json({ok:true,service:"JEV Browser Agent",version:"3.2.0",failurePolicy:"gemini-one-shot-recovery-then-stop",stepDelayMs:Number(process.env.STEP_DELAY_MS||5000),geminiRecovery:Boolean(process.env.GEMINI_API_KEY),maxSteps:MAX_STEPS,headless:process.env.HEADLESS==="true"}));
+app.post("/api/run",(req,res)=>{const task=req.body?.task;if(typeof task!=="string"||!task.trim())return res.status(400).json({error:"task is required"});const job=createJob(task.trim());runJob(job,job.task).catch(error=>{if(job.stats.status==="running"){job.stats.status="failed";job.stats.finishedAt=Date.now();emit(job,"error",{source:"unhandled",fatal:true,message:error.message});emit(job,"complete",{message:"Task stopped.",stats:getStats(job)});}});res.json({jobId:job.id});});
+app.post("/api/jobs/:id/stop",(req,res)=>{const job=jobs.get(req.params.id);if(!job)return res.status(404).json({error:"job not found"});job.stopRequested=true;emit(job,"stop_requested",{message:"Stop requested by user."});res.json({ok:true,jobId:job.id});});
 app.get("/api/jobs/:id/events",(req,res)=>{const job=jobs.get(req.params.id);if(!job)return res.status(404).end();res.writeHead(200,{"Content-Type":"text/event-stream","Cache-Control":"no-cache",Connection:"keep-alive"});for(const event of job.events)res.write(`data: ${JSON.stringify(event)}\n\n`);job.clients.add(res);req.on("close",()=>job.clients.delete(res));});
 app.get("/api/jobs/:id",(req,res)=>{const job=jobs.get(req.params.id);if(!job)return res.status(404).json({error:"job not found"});res.json({id:job.id,task:job.task,result:job.result,stats:getStats(job),events:job.events});});
 app.listen(PORT,()=>console.log(`JEV Browser Agent v3: http://localhost:${PORT}`));
