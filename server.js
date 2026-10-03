@@ -125,15 +125,32 @@ async function runJob(job,task) {
       const plan=await askJev(job,task,pageState), action=getAction(plan.decision,plan.candidates);
       if(action.type==="finish"){job.stats.status="completed";job.stats.finishedAt=Date.now();emit(job,"complete",{message:"Task completed.",step,url:page.url(),result:job.result,stats:getStats(job)});return;}
       emit(job,"action",{step,action:action.id,type:action.type,description:action.description});
-      try{const executed=await executeAction(job,context,page,action);page=executed.page;emit(job,"action_complete",{step,action:action.id,latencyMs:executed.latencyMs});}
-      catch(error){emit(job,"error",{source:"playwright",step,message:error.message});}
+      try{
+        const executed=await executeAction(job,context,page,action);
+        page=executed.page;
+        emit(job,"action_complete",{step,action:action.id,latencyMs:executed.latencyMs});
+      } catch(error) {
+        const message=`Browser action failed at step ${step} (${action.id}): ${error.message}`;
+        job.stats.status="failed";
+        job.stats.finishedAt=Date.now();
+        emit(job,"error",{source:"playwright",step,action:action.id,fatal:true,message});
+        emit(job,"complete",{message:"Task stopped after a browser action failure. No retry or further planning was performed.",step,url:page.url(),stats:getStats(job)});
+        return;
+      }
       await sleep(400);
     }
     throw new Error(`Maximum step count (${MAX_STEPS}) reached before the task completed.`);
-  } catch(error) { job.stats.status="failed";job.stats.finishedAt=Date.now();emit(job,"error",{source:"agent",message:error.message});emit(job,"complete",{message:"Task failed.",stats:getStats(job)}); }
+  } catch(error) {
+    if(job.stats.status==="running"){
+      job.stats.status="failed";
+      job.stats.finishedAt=Date.now();
+      emit(job,"error",{source:"agent",fatal:true,message:error.message});
+      emit(job,"complete",{message:"Task failed and was stopped. No further planning or browser actions will be attempted.",stats:getStats(job)});
+    }
+  }
   finally { if(browser) await browser.close().catch(()=>{}); job.stats.finishedAt??=Date.now(); closeJob(job); }
 }
-app.get("/api/health",(_req,res)=>res.json({ok:true,service:"JEV Browser Agent",version:"3.0.0",maxSteps:MAX_STEPS,headless:process.env.HEADLESS==="true"}));
+app.get("/api/health",(_req,res)=>res.json({ok:true,service:"JEV Browser Agent",version:"3.1.0",failurePolicy:"fail-fast-no-retry",maxSteps:MAX_STEPS,headless:process.env.HEADLESS==="true"}));
 app.post("/api/run",(req,res)=>{const task=req.body?.task;if(typeof task!=="string"||!task.trim())return res.status(400).json({error:"task is required"});const job=createJob(task.trim());runJob(job,job.task).catch(error=>emit(job,"error",{source:"unhandled",message:error.message}));res.json({jobId:job.id});});
 app.get("/api/jobs/:id/events",(req,res)=>{const job=jobs.get(req.params.id);if(!job)return res.status(404).end();res.writeHead(200,{"Content-Type":"text/event-stream","Cache-Control":"no-cache",Connection:"keep-alive"});for(const event of job.events)res.write(`data: ${JSON.stringify(event)}\n\n`);job.clients.add(res);req.on("close",()=>job.clients.delete(res));});
 app.get("/api/jobs/:id",(req,res)=>{const job=jobs.get(req.params.id);if(!job)return res.status(404).json({error:"job not found"});res.json({id:job.id,task:job.task,result:job.result,stats:getStats(job),events:job.events});});
