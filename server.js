@@ -99,8 +99,8 @@ async function executeAction(job,context,page,action) {
     case "scroll": if(action.direction==="bottom") await active.evaluate(()=>window.scrollTo(0,document.body.scrollHeight)); else if(action.direction==="top") await active.evaluate(()=>window.scrollTo(0,0)); else await active.mouse.wheel(0,action.direction==="down"?850:-850); break;
     case "wait": await sleep(action.ms); break;
     case "navigate": await active.goto(action.url,{waitUntil:"domcontentloaded",timeout:30000}); break;
-    case "back": await active.goBack({waitUntil:"domcontentloaded",timeout:20000}).catch(()=>{}); break;
-    case "forward": await active.goForward({waitUntil:"domcontentloaded",timeout:20000}).catch(()=>{}); break;
+    case "back": await active.goBack({waitUntil:"domcontentloaded",timeout:20000}); break;
+    case "forward": await active.goForward({waitUntil:"domcontentloaded",timeout:20000}); break;
     case "reload": await active.reload({waitUntil:"domcontentloaded",timeout:30000}); break;
     case "extract": { result=await active.locator("body").innerText({timeout:5000}).catch(()=>""); result=result.slice(0,PAGE_TEXT_LIMIT); job.result=result; emit(job,"extracted",{url:active.url(),title:await active.title().catch(()=>"") ,text:result}); break; }
     case "screenshot": { const path=`./screenshots-${job.id}.png`; await active.screenshot({path}); emit(job,"screenshot",{path}); break; }
