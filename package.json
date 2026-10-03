@@ -1,0 +1,15 @@
+{
+  "name": "jev-browser-agent",
+  "version": "3.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Natural-language browser automation agent using TypeSafe AI and Playwright",
+  "engines": { "node": ">=20" },
+  "scripts": { "start": "node server.js", "dev": "node server.js" },
+  "dependencies": {
+    "@typesafe-ai/sdk": "^0.6.0",
+    "dotenv": "^16.4.7",
+    "express": "^4.21.2",
+    "playwright": "^1.55.0"
+  }
+}
